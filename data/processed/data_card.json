@@ -1,0 +1,26 @@
+{
+  "dataset_name": "Depression Severity Levels Dataset",
+  "total_cleaned_rows": 32368,
+  "train_rows": 25894,
+  "test_rows": 6474,
+  "seed": 42,
+  "class_distribution_all": {
+    "severe": 10669,
+    "mild": 10647,
+    "minimum": 6291,
+    "moderate": 4761
+  },
+  "class_distribution_train": {
+    "severe": 8535,
+    "mild": 8517,
+    "minimum": 5033,
+    "moderate": 3809
+  },
+  "class_distribution_test": {
+    "severe": 2134,
+    "mild": 2130,
+    "minimum": 1258,
+    "moderate": 952
+  },
+  "avg_text_clean_word_count": 130.21178324270886
+}
