@@ -1,112 +1,134 @@
+#Final
 import os
-import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Dict, Any
 import pandas as pd
-from typing import List
+import torch
+
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 
-PROCESSED_DATA_DIR = r"c:\depression-suicide\data\processed"
-CHROMA_PERSIST_DIR = r"c:\depression-suicide\vectorstore\chroma_db"
-COLLECTION_NAME = "depression_severity_posts"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# Maximize multi-core CPU performance
+torch.set_num_threads(os.cpu_count() or 4)
 
-def load_train_documents(train_csv_path: str = None, max_docs: int = 3000) -> List[Document]:
-    if train_csv_path is None:
-        train_csv_path = os.path.join(PROCESSED_DATA_DIR, "train.csv")
-        
-    print(f"[*] Loading training posts from: {train_csv_path}", flush=True)
-    df = pd.read_csv(train_csv_path)
+@dataclass
+class IngestionConfig:
+    csv_path: str = "data/processed/train.csv"
+    text_column: str = "text"
+    id_column: str = "id"
+    label_column: str = "label"
+
+    # SPEED TWEAK 1: 700 chars reduces chunk count by ~40% while staying well under 256 tokens
+    chunk_size: int = 700
+    chunk_overlap: int = 70
+    separators: List[str] = field(default_factory=lambda: [
+        "\n\n", "\n", ". ", "? ", "! ", "; ", " ", ""
+    ])
+
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # SPEED TWEAK 2: 256 internal batch size for PyTorch
+    embed_batch_size: int = 256
     
-    if len(df) > max_docs:
-        print(f"[*] Sampling {max_docs} balanced posts for fast vector database indexing...", flush=True)
-        sampled_dfs = []
-        n_per_class = max_docs // len(df['label'].unique())
-        for label, group in df.groupby('label'):
-            sampled_dfs.append(group.sample(n=min(len(group), n_per_class), random_state=42))
-        df = pd.concat(sampled_dfs).sample(frac=1, random_state=42).reset_index(drop=True)
-        
-    documents = []
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-    
-    for idx, row in df.iterrows():
-        doc_id = str(row['id']) if 'id' in row and pd.notnull(row['id']) else f"post_{idx}"
-        label = str(row['label']) if 'label' in row else "unknown"
-        text = str(row['text_clean']) if pd.notnull(row['text_clean']) else str(row['text'])
-        
-        if len(text.strip()) == 0:
-            continue
-            
-        metadata = {
-            "id": doc_id,
-            "label": label,
-            "char_len": len(text)
-        }
-        
-        if len(text) <= 800:
-            doc = Document(page_content=text, metadata=metadata)
-            documents.append(doc)
-        else:
-            chunks = text_splitter.split_text(text)
-            for chunk_idx, chunk in enumerate(chunks):
-                chunk_meta = metadata.copy()
-                chunk_meta["chunk_id"] = f"{doc_id}_c{chunk_idx}"
-                documents.append(Document(page_content=chunk, metadata=chunk_meta))
-                
-    print(f"[+] Loaded and chunked {len(documents)} document objects from training set.", flush=True)
-    return documents
+    # SPEED TWEAK 3: 2,000 batch size for Chroma to minimize disk writes
+    persist_directory: str = "vectorstore/chroma_db"
+    collection_name: str = "train_collection"
+    batch_size: int = 2000
 
-def get_embedding_model(model_name: str = EMBEDDING_MODEL_NAME):
-    print(f"[*] Initializing HuggingFace Embeddings model: {model_name}...", flush=True)
-    embeddings = HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
-    return embeddings
 
-def build_vector_store(
-    documents: List[Document] = None,
-    persist_dir: str = CHROMA_PERSIST_DIR,
-    collection_name: str = COLLECTION_NAME,
-    batch_size: int = 500
-) -> Chroma:
-    if documents is None:
-        documents = load_train_documents()
-        
-    embeddings = get_embedding_model()
-    
-    print(f"[*] Building Chroma DB vector collection at: {persist_dir}", flush=True)
-    os.makedirs(persist_dir, exist_ok=True)
-    
-    vectorstore = Chroma(
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        persist_directory=persist_dir
-    )
-    
-    print(f"[*] Adding {len(documents)} documents to Chroma in batches of {batch_size}...", flush=True)
-    for i in range(0, len(documents), batch_size):
-        batch = documents[i:i + batch_size]
-        texts = [doc.page_content for doc in batch]
-        metadatas = [doc.metadata for doc in batch]
-        ids = [f"{doc.metadata.get('id', 'doc')}_{i+j}" for j, doc in enumerate(batch)]
-        
-        vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
-        print(f"    -> Indexed {min(i + batch_size, len(documents))}/{len(documents)} documents...", flush=True)
-        
-    print(f"[+] Successfully built and persisted Chroma DB vector store at: {persist_dir}", flush=True)
-    return vectorstore
+class IngestionPipeline:
+    def __init__(self, config: Optional[IngestionConfig] = None):
+        self.config = config or IngestionConfig()
+        self._splitter: Optional[RecursiveCharacterTextSplitter] = None
+        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._vector_store: Optional[Chroma] = None
 
-def load_existing_vector_store(persist_dir: str = CHROMA_PERSIST_DIR, collection_name: str = COLLECTION_NAME) -> Chroma:
-    embeddings = get_embedding_model()
-    vectorstore = Chroma(
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        persist_directory=persist_dir
-    )
-    return vectorstore
+    def load_csv(self) -> pd.DataFrame:
+        csv_file = Path(self.config.csv_path)
+        if not csv_file.exists():
+            raise FileNotFoundError(f"[Error] CSV not found at: {csv_file.resolve()}")
 
-if __name__ == "__main__":
-    build_vector_store()
+        print(f"[1/4] Loading CSV from: {csv_file}")
+        df = pd.read_csv(csv_file)
+        df = df.dropna(subset=[self.config.text_column])
+        print(f"      Loaded {len(df)} records.")
+        return df
+
+    def convert_to_documents(self, df: pd.DataFrame) -> List[Document]:
+        print(f"[2/4] Chunking text (chunk_size={self.config.chunk_size})...")
+        if self._splitter is None:
+            self._splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.config.chunk_size,
+                chunk_overlap=self.config.chunk_overlap,
+                separators=self.config.separators
+            )
+
+        documents: List[Document] = []
+        for _, row in df.iterrows():
+            content = str(row[self.config.text_column]).strip()
+            base_id = str(row[self.config.id_column])
+            label = str(row[self.config.label_column]) if pd.notnull(row[self.config.label_column]) else ""
+
+            chunks = self._splitter.split_text(content)
+            for idx, chunk in enumerate(chunks):
+                documents.append(Document(
+                    page_content=chunk,
+                    metadata={
+                        "id": f"{base_id}_{idx}",
+                        "original_id": base_id,
+                        "label": label,
+                        "chunk_index": idx,
+                        "total_chunks": len(chunks)
+                    }
+                ))
+
+        print(f"      Total chunks generated: {len(documents)}")
+        return documents
+
+    def get_embeddings(self) -> HuggingFaceEmbeddings:
+        if self._embeddings is None:
+            print(f"[3/4] Initializing embeddings on device: {self.config.device}...")
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name=self.config.model_name,
+                model_kwargs={"device": self.config.device},
+                encode_kwargs={
+                    "normalize_embeddings": True,
+                    "batch_size": self.config.embed_batch_size  # Fast batching
+                }
+            )
+        return self._embeddings
+
+    def build_vector_store(self, documents: List[Document]) -> Chroma:
+        persist_path = Path(self.config.persist_directory)
+        persist_path.mkdir(parents=True, exist_ok=True)
+
+        embeddings = self.get_embeddings()
+        print(f"[4/4] Ingesting {len(documents)} chunks into Chroma (batch size = {self.config.batch_size})...")
+
+        vector_store = Chroma(
+            collection_name=self.config.collection_name,
+            embedding_function=embeddings,
+            persist_directory=str(persist_path)
+        )
+
+        total_docs = len(documents)
+        batch_size = self.config.batch_size
+
+        for i in range(0, total_docs, batch_size):
+            batch = documents[i : i + batch_size]
+            vector_store.add_documents(documents=batch)
+            print(f"      -> Ingested {min(i + batch_size, total_docs)} / {total_docs} chunks...")
+
+        print(f"      Ingestion complete! Persisted to '{persist_path}'.")
+        self._vector_store = vector_store
+        return vector_store
+
+    def run(self) -> Chroma:
+        df = self.load_csv()
+        documents = self.convert_to_documents(df)
+        return self.build_vector_store(documents)
+
