@@ -5,14 +5,10 @@ from typing import Dict, Any, List
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
-from src.retrieval import SeverityRetriever
+from src.retrieval import RetrieverConfig, SimilarityRetriever
 from src.safety import SafetyInterceptor
-from dotenv import load_dotenv
 
-import os
-
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 AVAILABLE_GROQ_MODELS = [
     "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
@@ -64,7 +60,8 @@ class DepressionRAGChain:
     def __init__(self, api_key: str = GROQ_API_KEY, model_names: List[str] = AVAILABLE_GROQ_MODELS):
         self.api_key = api_key
         self.model_names = model_names
-        self.retriever = SeverityRetriever()
+        self.retrieverConfig = RetrieverConfig()
+        self.retriever = SimilarityRetriever(config=self.retrieverConfig)
         self.safety = SafetyInterceptor()
         self.history = ChatMessageHistory()
         self.active_llm = None
@@ -143,7 +140,7 @@ class DepressionRAGChain:
         retrieved_posts = []
         context_str = "No vector DB loaded yet."
         try:
-            retrieved_posts = self.retriever.retrieve_similar_posts(user_input, top_k=top_k, use_mmr=use_mmr)
+            retrieved_posts = self.retriever.similarity_search(user_input, top_k=top_k)
             context_str = self.retriever.format_context_for_prompt(retrieved_posts)
         except Exception as e:
             print(f"[!] Vector retrieval note: {e}", flush=True)
