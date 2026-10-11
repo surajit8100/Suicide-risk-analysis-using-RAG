@@ -1,95 +1,150 @@
-import os
-from typing import List, Dict, Any
+# Retrieval pipeline--src/retriever.py
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from src.ingestion import load_existing_vector_store, CHROMA_PERSIST_DIR, COLLECTION_NAME
 
-class SeverityRetriever:
-    """Retriever wrapper for fetching relevant labeled posts from Chroma DB."""
-    
-    def __init__(self, persist_dir: str = CHROMA_PERSIST_DIR, collection_name: str = COLLECTION_NAME):
-        self.persist_dir = persist_dir
-        self.collection_name = collection_name
-        self.vectorstore = None
+
+# ===========================================================================
+# 1. Configuration Data Class
+# ===========================================================================
+@dataclass
+class RetrieverConfig:
+    """Configuration settings for connecting to and querying Chroma DB."""
+    persist_directory: str = "vectorstore/chroma_db"
+    collection_name: str = "train_collection"
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    device: str = "cpu"
+    default_top_k: int = 3
+    deduplicate_by_parent: bool = True
+
+
+# ===========================================================================
+# 2. Main Systematic Retriever Class
+# ===========================================================================
+class SimilarityRetriever:
+    """
+    Modular retriever to connect to an existing persisted Chroma vector store,
+    perform similarity search, MMR diversity search, metadata filtering,
+    and parent-document deduplication.
+    """
+
+    def __init__(self, config: Optional[RetrieverConfig] = None):
+        self.config = config or RetrieverConfig()
+        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._vector_store: Optional[Chroma] = None
         
-    def _ensure_loaded(self):
-        if self.vectorstore is None:
-            if not os.path.exists(self.persist_dir):
-                raise FileNotFoundError(f"Chroma DB vector store directory not found at {self.persist_dir}. Run ingestion.py first!")
-            self.vectorstore = load_existing_vector_store(self.persist_dir, self.collection_name)
+        # Connect to Chroma on initialization
+        self._connect_vector_store()
 
-    def retrieve_similar_posts(
-        self, 
-        query: str, 
-        top_k: int = 5, 
-        use_mmr: bool = False,
-        label_filter: str = None
+    # -----------------------------------------------------------------------
+    # Step A: Load Embeddings and Connect to Vector Store
+    # -----------------------------------------------------------------------
+    def get_embeddings(self) -> HuggingFaceEmbeddings:
+        """Initializes and returns the cached Hugging Face embedding function."""
+        if self._embeddings is None:
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name=self.config.model_name,
+                model_kwargs={"device": self.config.device},
+                encode_kwargs={"normalize_embeddings": True}
+            )
+        return self._embeddings
+
+    def _connect_vector_store(self) -> Chroma:
+        """Connects to the persisted Chroma database index on disk."""
+        db_path = Path(self.config.persist_directory)
+        if not db_path.exists():
+            raise FileNotFoundError(
+                f"[Error] Chroma database directory not found at: '{db_path.resolve()}'. "
+                f"Please run ingestion first."
+            )
+
+        print(f"[*] Connecting to persisted Chroma DB at: '{db_path.resolve()}'")
+        embeddings = self.get_embeddings()
+
+        self._vector_store = Chroma(
+            collection_name=self.config.collection_name,
+            embedding_function=embeddings,
+            persist_directory=str(db_path)
+        )
+        print(f"[✓] Connected successfully to collection: '{self.config.collection_name}'\n")
+        return self._vector_store
+
+    # -----------------------------------------------------------------------
+    # Step B: Standard Similarity Search (with deduplication)
+    # -----------------------------------------------------------------------
+    def similarity_search(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        label_filter: Optional[str] = None,
+        deduplicate: Optional[bool] = None
     ) -> List[Dict[str, Any]]:
         """
-        Retrieves top-k similar posts for a given query text.
-        
-        Returns:
-            List of dicts: [{'id': str, 'text': str, 'label': str, 'score': float}]
+        Executes similarity search with distance score calculation.
         """
-        self._ensure_loaded()
+        k = top_k or self.config.default_top_k
+        should_dedup = deduplicate if deduplicate is not None else self.config.deduplicate_by_parent
         
-        search_kwargs = {}
-        if label_filter:
-            search_kwargs["filter"] = {"label": label_filter}
-            
-        results = []
-        if use_mmr:
-            docs = self.vectorstore.max_marginal_relevance_search(
-                query=query, 
-                k=top_k, 
-                fetch_k=top_k * 3,
-                **search_kwargs
-            )
-            for doc in docs:
-                results.append({
-                    "id": doc.metadata.get("id", "unknown"),
-                    "text": doc.page_content,
-                    "label": doc.metadata.get("label", "unknown"),
-                    "score": None
-                })
-        else:
-            docs_and_scores = self.vectorstore.similarity_search_with_score(
-                query=query, 
-                k=top_k,
-                **search_kwargs
-            )
-            for doc, score in docs_and_scores:
-                results.append({
-                    "id": doc.metadata.get("id", "unknown"),
-                    "text": doc.page_content,
-                    "label": doc.metadata.get("label", "unknown"),
-                    "score": float(score)
-                })
-                
+        fetch_k = k * 3 if should_dedup else k
+        where_filter = {"label": label_filter} if label_filter else None
+
+        raw_results = self._vector_store.similarity_search_with_score(
+            query=query,
+            k=fetch_k,
+            filter=where_filter
+        )
+
+        results: List[Dict[str, Any]] = []
+        seen_parents = set()
+
+        for doc, score in raw_results:
+            parent_id = doc.metadata.get("original_id", "N/A")
+
+            if should_dedup and parent_id in seen_parents:
+                continue
+
+            seen_parents.add(parent_id)
+
+            results.append({
+                "chunk_id": doc.metadata.get("id", "N/A"),
+                #"original_id": parent_id,
+                "label": doc.metadata.get("label", "N/A"),
+                #"chunk_index": doc.metadata.get("chunk_index", 0) + 1,
+                #"total_chunks": doc.metadata.get("total_chunks", 1),
+                "distance_score": round(float(score), 4),
+                "content": doc.page_content.strip()
+            })
+
+            if len(results) >= k:
+                break
+
         return results
 
     def format_context_for_prompt(self, retrieved_posts: List[Dict[str, Any]]) -> str:
-        """Formats retrieved labeled posts into a clean context string for LLM prompting."""
+        """
+        Formats retrieved posts into a structured, labeled text block
+        ready for insertion into the LLM prompt's {context} variable.
+        """
         if not retrieved_posts:
-            return "No historical reference posts found."
-            
-        formatted_blocks = []
-        for i, post in enumerate(retrieved_posts, start=1):
-            block = (
-                f"Reference Example #{i}:\n"
-                f"Historical Severity Label: {post['label'].upper()}\n"
-                f"Post Text: \"{post['text']}\"\n"
-            )
-            formatted_blocks.append(block)
-            
-        return "\n-------------------\n".join(formatted_blocks)
+            return "No reference historical posts available."
 
-if __name__ == "__main__":
-    retriever = SeverityRetriever()
-    test_query = "I feel so lonely and tired of failing every single day."
-    print(f"[*] Testing retriever with query: '{test_query}'")
-    try:
-        posts = retriever.retrieve_similar_posts(test_query, top_k=3)
-        for p in posts:
-            print(f"[{p['label'].upper()}] Score: {p['score']} | {p['text'][:80]}...")
-    except Exception as e:
-        print("[!] Retrieval test error:", e)
+        context_blocks = []
+        for rank, post in enumerate(retrieved_posts, start=1):
+            label = str(post.get("label", "unknown")).upper()
+            content = post.get("content", post.get("text", "")).strip()
+            score = post.get("distance_score", post.get("score", None))
+
+            score_str = f" | Distance Score: {score:.4f}" if score is not None else ""
+
+            block = (
+                f"--- Reference Post #{rank} [True Severity: {label}{score_str}] ---\n"
+                f"\"{content}\""
+            )
+            context_blocks.append(block)
+
+        return "\n\n".join(context_blocks)
