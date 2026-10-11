@@ -3,6 +3,7 @@ import json
 import time
 import datetime
 import streamlit as st
+from src.safety import CRISIS_RESOURCES_INDIA, STANDARD_DISCLAIMER
 
 # Page Configuration
 st.set_page_config(
@@ -58,13 +59,51 @@ st.markdown("""
         font-weight: 700;
         font-size: 1.1rem;
     }
+     /* Crisis Box: Explicit dark text to guarantee readability in Dark Mode */
     .crisis-box {
-        background-color: #FEF2F2;
-        border-left: 6px solid #DC2626;
-        padding: 1rem;
-        border-radius: 6px;
-        margin-top: 1rem;
-        margin-bottom: 1rem;
+      background-color: #FFF1F2 !important;
+        border-left: 6px solid #DC2626 !important;
+        padding: 1.25rem !important;
+        border-radius: 8px !important;
+        margin-top: 1rem !important;
+        margin-bottom: 1rem !important;
+        color: #1E293B !important;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    }
+    .crisis-box h3 {
+        color: #DC2626 !important;
+        font-size: 1.3rem !important;
+        font-weight: 700 !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.5rem !important;
+    }
+    .crisis-box p {
+        color: #881337 !important;
+        font-size: 0.98rem !important;
+        margin-bottom: 0.75rem !important;
+    }
+    .crisis-box ul {
+        margin: 0 !important;
+        padding-left: 1.4rem !important;
+    }
+    .crisis-box li {
+        color: #334155 !important;
+        font-size: 0.96rem !important;
+        margin-bottom: 0.5rem !important;
+        line-height: 1.5 !important;
+    }
+    .crisis-box li b {
+        color: #0F172A !important;
+    }
+    .crisis-box .helpline-number {
+        color: #DC2626 !important;
+        font-size: 1.15rem !important;
+        font-weight: 700 !important;
+        margin: 0 4px !important;
+    }
+    .crisis-box .helpline-desc {
+        color: #64748B !important;
+        font-size: 0.88rem !important;
     }
     .disclaimer-box {
         background-color: #F8FAFC;
@@ -75,6 +114,7 @@ st.markdown("""
         color: #64748B;
         margin-top: 1.5rem;
     }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -166,7 +206,7 @@ if user_prompt:
     with st.chat_message("assistant"):
         with st.spinner("Analyzing text, retrieving reference posts, and checking safety guardrails..."):
             start_t = time.time()
-            output = rag_chain.process_query(user_prompt, top_k=top_k, use_mmr=use_mmr)
+            output = rag_chain.process_query(user_prompt, top_k=top_k)
             latency = time.time() - start_t
             
             severity = output.get("severity", "moderate").lower()
@@ -174,7 +214,7 @@ if user_prompt:
             rationale = output.get("rationale", "")
             confidence_note = output.get("confidence_note", "")
             suggestions = output.get("suggestions", [])
-            crisis = output.get("crisis_resources", None)
+            crisis = output.get("crisis_resources") or CRISIS_RESOURCES_INDIA
             disclaimer = output.get("disclaimer", "")
             retrieved = output.get("retrieved_context", [])
             
@@ -183,15 +223,28 @@ if user_prompt:
             
             # 1. Crisis Banner (If Risk Detected)
             if risk_detected and crisis:
+                # st.markdown(f"""
+                # <div class="crisis-box">
+                #     <h3 style="color:#DC2626; margin-top:0;">🚨 Immediate Crisis Support Resources ({crisis['country']})</h3>
+                #     <p><b>If you or someone you know is in distress, immediate help is available 24/7:</b></p>
+                #     <ul>
+                #         {"".join(f"<li><b>{h['name']}</b>: <span style='font-size:1.1rem; font-weight:bold;'>{h['number']}</span> ({h['availability']})</li>" for h in crisis['helplines'])}
+                #     </ul>
+                # </div>
+                # """, unsafe_allow_html=True)
+                helpline_items = "".join(
+                     f"<li><b>{h['name']}</b>: <span style='font-size:1.15rem; font-weight:bold; color:#B91C1C;'>{h['number']}</span> ({h['availability']})</li>"
+                     for h in crisis.get("helplines", [])
+                     )
                 st.markdown(f"""
-                <div class="crisis-box">
-                    <h3 style="color:#DC2626; margin-top:0;">🚨 Immediate Crisis Support Resources ({crisis['country']})</h3>
-                    <p><b>If you or someone you know is in distress, immediate help is available 24/7:</b></p>
-                    <ul>
-                        {"".join(f"<li><b>{h['name']}</b>: <span style='font-size:1.1rem; font-weight:bold;'>{h['number']}</span> ({h['availability']})</li>" for h in crisis['helplines'])}
-                    </ul>
-                </div>
-                """, unsafe_allow_html=True)
+                 <div class="crisis-box">
+                    <h3 style="color:#DC2626; margin-top:0;">🚨 Immediate Crisis Support Resources ({crisis.get('country', 'India')})</h3>
+                    <p style="color:#7F1D1D;"><b>If you or someone you know is in distress or having thoughts of self-harm, confidential help is available 24/7:</b></p>
+                   <ul>
+                   {helpline_items}
+                   </ul>
+                 </div>
+                   """, unsafe_allow_html=True)
                 
             # 2. Severity Badge & Risk Status
             badge_class = f"badge-{severity}"
@@ -221,7 +274,7 @@ if user_prompt:
                 with st.expander(f"📚 View {len(retrieved)} Similar Dataset Examples Retrieved from Chroma DB"):
                     for idx, post in enumerate(retrieved, start=1):
                         st.markdown(f"**Example #{idx}** | **True Dataset Label:** `{post['label'].upper()}`")
-                        st.text(post['text'])
+                        st.text(post.get('text', post.get('content', '')))
                         if post.get('score') is not None:
                             st.caption(f"Distance Score: {post['score']:.4f}")
                         st.markdown("---")
